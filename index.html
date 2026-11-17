@@ -114,7 +114,10 @@
 const $ = s => document.querySelector(s);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const VERSION = "v5";
 const API = "https://api.spotify.com/v1";
+const plog = [];
+function logp(s){ plog.push(new Date().toLocaleTimeString() + " " + s); if (plog.length > 40) plog.shift(); }
 const SCOPES = [
   "playlist-read-private","playlist-read-collaborative",
   "playlist-modify-private","playlist-modify-public",
@@ -224,6 +227,7 @@ async function sp(method, path, body, opts = {}){
   }
   const text = await res.text();
   let data = null; try { data = text ? JSON.parse(text) : null; } catch {}
+  if (path.startsWith("/me/player")) logp(`${method} ${path}${opts.query ? " " + JSON.stringify(opts.query) : ""} -> ${res.status}${!res.ok ? " " + (data?.error?.message || "") + (data?.error?.reason ? " [" + data.error.reason + "]" : "") : ""}`);
   if (!res.ok) {
     const e = new Error(data?.error?.message || ("Spotify error " + res.status));
     e.status = res.status; e.reason = data?.error?.reason; throw e;
@@ -325,6 +329,7 @@ function renderHome(){
   $("#app").innerHTML = `
     <div class="bar"><h1 style="flex:1;margin:6px 0">Swipe Playlist</h1><button class="chip" id="set">Settings</button></div>
     <button class="primary" id="new">+ New playlist</button>
+    <p class="hint" style="text-align:center;margin-top:8px">Splinder ${VERSION}</p>
     <div class="list">
       ${idx.length ? idx.map(x => `
         <div class="item" data-id="${esc(x.id)}">
@@ -650,19 +655,26 @@ const NO_DEVICE = "No Spotify app found. Open Spotify (desktop or phone), play a
 let playToken = 0;
 function setPlayNote(msg, isErr){
   const el = $("#pnote"); if (!el) return;
-  el.textContent = msg || ""; el.style.color = isErr ? "var(--no)" : "";
+  el.innerHTML = esc(msg || "") + (isErr ? ` <a href="#" id="dbg" style="color:var(--accent)">Copy details for Claude</a>` : "");
+  el.style.color = isErr ? "var(--no)" : "";
+  const d = $("#dbg");
+  if (d) d.onclick = async e => {
+    e.preventDefault();
+    const text = `SPLINDER PLAYBACK DEBUG ${VERSION}\n${navigator.userAgent}\n` + plog.join("\n");
+    try { await navigator.clipboard.writeText(text); toast("Copied. Paste it to Claude."); } catch { toast("Couldn't copy."); }
+  };
 }
 async function playUri(uri){
   // Always aim the command at a specific device so Spotify can't ignore it.
   let d = await pickDevice();
   if (!d) throw new Error(NO_DEVICE);
   try {
-    await sp("PUT", "/me/player/play", { uris: [uri] }, { query: { device_id: d.id } });
+    await sp("PUT", "/me/player/play", { uris: [uri], position_ms: 0 }, { query: { device_id: d.id } });
   } catch (e) {
     if (e.status === 404 || e.status === 502 || /device/i.test(e.message)) {
       await sleep(600);
       d = await pickDevice(); if (!d) throw new Error(NO_DEVICE);
-      await sp("PUT", "/me/player/play", { uris: [uri] }, { query: { device_id: d.id } });
+      await sp("PUT", "/me/player/play", { uris: [uri], position_ms: 0 }, { query: { device_id: d.id } });
     } else throw e;
   }
   return d;
@@ -672,17 +684,29 @@ function sameTrack(item, t){
   if (item.uri === t.uri || item.linked_from?.uri === t.uri) return true;
   return norm(item.name) === norm(t.name);
 }
+async function queueAndSkip(uri){
+  const d = await pickDevice(); if (!d) throw new Error(NO_DEVICE);
+  await sp("POST", "/me/player/queue", null, { query: { uri, device_id: d.id } });
+  await sleep(400);
+  await sp("POST", "/me/player/next", null, { query: { device_id: d.id } });
+  return d;
+}
 async function verifyPlaying(t, token, dev, tries = 0){
-  await sleep(1200);
+  await sleep(1300);
   if (token !== playToken || S?.queue[0]?.uri !== t.uri) return;
   const p = await sp("GET", "/me/player/currently-playing").catch(() => null);
+  logp(`now playing: ${p?.item ? p.item.name + " (" + p.item.uri + ")" : "nothing"}; wanted ${t.name} (${t.uri})`);
   if (token !== playToken) return;
   if (sameTrack(p?.item, t)) { playing = { uri: t.uri, on: !!p.is_playing }; updatePlayBtn(); setPlayNote(`Playing on ${dev?.name || "Spotify"}`); return; }
-  if (tries < 2) {
-    try { dev = await playUri(t.uri); } catch (e) { setPlayNote(e.message, true); return; }
-    return verifyPlaying(t, token, dev, tries + 1);
-  }
-  setPlayNote(`Spotify didn't switch songs${p?.item?.name ? ` (still playing “${p.item.name}”)` : ""}. Tap ▶ to try again.`, true);
+  try {
+    if (tries === 0) { setPlayNote("Retrying…"); dev = await playUri(t.uri); }
+    else if (tries === 1) { setPlayNote("Trying another way…"); dev = await queueAndSkip(t.uri); }
+    else {
+      setPlayNote(`Spotify didn't switch songs${p?.item?.name ? ` (still playing “${p.item.name}”)` : ""}. Tap ▶ to try again.`, true);
+      return;
+    }
+  } catch (e) { setPlayNote(e.message, true); return; }
+  return verifyPlaying(t, token, dev, tries + 1);
 }
 async function playCurrent(auto = false){
   const t = S?.queue[0]; if (!t) return;
