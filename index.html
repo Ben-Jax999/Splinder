@@ -114,7 +114,7 @@
 const $ = s => document.querySelector(s);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-const VERSION = "v5";
+const VERSION = "v6";
 const API = "https://api.spotify.com/v1";
 const plog = [];
 function logp(s){ plog.push(new Date().toLocaleTimeString() + " " + s); if (plog.length > 40) plog.shift(); }
@@ -697,10 +697,13 @@ async function verifyPlaying(t, token, dev, tries = 0){
   const p = await sp("GET", "/me/player/currently-playing").catch(() => null);
   logp(`now playing: ${p?.item ? p.item.name + " (" + p.item.uri + ")" : "nothing"}; wanted ${t.name} (${t.uri})`);
   if (token !== playToken) return;
-  if (sameTrack(p?.item, t)) { playing = { uri: t.uri, on: !!p.is_playing }; updatePlayBtn(); setPlayNote(`Playing on ${dev?.name || "Spotify"}`); return; }
+  if (sameTrack(p?.item, t)) {
+    if (!p.is_playing && dev) { await sp("PUT", "/me/player/play", null, { query: { device_id: dev.id } }).catch(() => {}); }
+    playing = { uri: t.uri, on: true }; updatePlayBtn(); setPlayNote(`Playing on ${dev?.name || "Spotify"}`); return;
+  }
   try {
-    if (tries === 0) { setPlayNote("Retrying…"); dev = await playUri(t.uri); }
-    else if (tries === 1) { setPlayNote("Trying another way…"); dev = await queueAndSkip(t.uri); }
+    if (tries === 0) { setPlayNote("Trying another way…"); dev = await playUri(t.uri); }
+    else if (tries === 1) { setPlayNote("Retrying…"); dev = await queueAndSkip(t.uri); }
     else {
       setPlayNote(`Spotify didn't switch songs${p?.item?.name ? ` (still playing “${p.item.name}”)` : ""}. Tap ▶ to try again.`, true);
       return;
@@ -713,10 +716,15 @@ async function playCurrent(auto = false){
   const token = ++playToken;
   setPlayNote("Starting song…");
   try {
-    const dev = await playUri(t.uri);
+    // Queue the song and skip to it: this is the method Spotify reliably honors.
+    const dev = await queueAndSkip(t.uri);
     playing = { uri: t.uri, on: true }; updatePlayBtn();
     verifyPlaying(t, token, dev);
-  } catch (e) { if (token === playToken) setPlayNote(e.message, true); }
+  } catch (e) {
+    // Queueing can fail when nothing has played yet; fall back to a direct play command.
+    try { const dev = await playUri(t.uri); playing = { uri: t.uri, on: true }; verifyPlaying(t, token, dev, 1); }
+    catch (e2) { if (token === playToken) setPlayNote(e2.message, true); }
+  }
   updatePlayBtn();
 }
 async function togglePlay(){
