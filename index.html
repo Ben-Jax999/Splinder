@@ -94,6 +94,12 @@
   .big-num{font-size:56px;font-weight:800;color:var(--yes);text-align:center;margin:20px 0 0}
   a.btnlink{display:block;text-align:center;text-decoration:none}
   .danger{color:var(--no)}
+  .checklist{max-height:280px;overflow:auto;background:var(--panel);border:1px solid var(--line);border-radius:10px}
+  .checklist label{display:flex;gap:10px;align-items:center;padding:12px;border-bottom:1px solid var(--line);font-size:15px}
+  .checklist label:last-child{border-bottom:none}
+  .checklist input{width:20px;height:20px;flex:none}
+  .checklist .grow{flex:1;min-width:0}
+  .tag{display:inline-block;font-size:11px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;color:var(--accent);margin-right:6px}
   .panel{width:100%;background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:16px}
   .modal .panel{border:none;padding:0;background:transparent}
 </style>
@@ -384,19 +390,27 @@ function renderNew(){
     <h2>Name</h2>
     <input type="text" id="name" maxlength="100" placeholder="Late Night Drive">
     <h2>Description</h2>
-    <p class="hint">Goes on the Spotify playlist and tells the picker what you're going for.</p>
+    <p class="hint">Goes on the Spotify playlist and tells Claude what you're going for.</p>
     <textarea id="desc" maxlength="300" placeholder="Moody 2000s and 2010s indie for driving around at night"></textarea>
     <h2>Extra guidance <span class="hint">(optional, private)</span></h2>
     <textarea id="guide" placeholder="No explicit songs. Lean toward tracks with big choruses."></textarea>
     <h2>How to start</h2>
     <div class="seg">
-      <label><input type="radio" name="mode" value="seed" checked><span>From a playlist</span></label>
+      <label><input type="radio" name="mode" value="seed" checked><span>From my playlists</span></label>
       <label><input type="radio" name="mode" value="batch"><span>Batches only</span></label>
     </div>
     <div id="seedBox">
-      <h2>Start from</h2>
-      <p class="hint">Only playlists you own or collaborate on can be read. To use someone else's, add its songs to a playlist of yours in Spotify first.</p>
-      <select id="seed"><option value="">Loading your playlists…</option></select>
+      <h2>Start from <span class="hint" id="selCount"></span></h2>
+      <p class="hint">Pick one or more. Only playlists you own or collaborate on can be read. To use someone else's, add its songs to a playlist of yours in Spotify first.</p>
+      <div class="checklist" id="seedList"><div class="hint" style="padding:12px">Loading your playlists…</div></div>
+      <h2>Starting round</h2>
+      <p class="hint">How many songs from your playlists to swipe first, alternating between them. After that, each batch mixes the rest of your playlists' songs with new ones.</p>
+      <select id="round">
+        <option value="10">10 songs</option>
+        <option value="20" selected>20 songs</option>
+        <option value="30">30 songs</option>
+        <option value="all">All of them</option>
+      </select>
     </div>
     <label class="toggle"><input type="checkbox" id="pub"> Make the new playlist public</label>
     <button class="primary" id="start">Start swiping</button>
@@ -406,11 +420,17 @@ function renderNew(){
   document.querySelectorAll('input[name="mode"]').forEach(r => r.onchange = () => {
     seedBox.style.display = $('input[name="mode"]:checked').value === "seed" ? "" : "none";
   });
+  const updCount = () => {
+    const n = document.querySelectorAll("#seedList input:checked").length;
+    $("#selCount").textContent = n ? `(${n} selected)` : "";
+  };
   loadMyPlaylists().then(list => {
-    $("#seed").innerHTML = list.length
-      ? `<option value="">Choose a playlist</option>` + list.map(p => `<option value="${esc(p.id)}">${esc(p.name)}${p.total !== "" ? ` (${p.total})` : ""}</option>`).join("")
-      : `<option value="">No playlists of yours found</option>`;
-  }).catch(e => { $("#seed").innerHTML = `<option value="">Couldn't load playlists</option>`; toast(e.message); });
+    $("#seedList").innerHTML = list.length
+      ? list.map(p => `<label><input type="checkbox" value="${esc(p.id)}" data-name="${esc(p.name)}">
+          <span class="grow">${esc(p.name)}</span><span class="hint" style="margin:0">${p.total !== "" ? esc(p.total) : ""}</span></label>`).join("")
+      : `<div class="hint" style="padding:12px">No playlists of yours found.</div>`;
+    document.querySelectorAll("#seedList input").forEach(c => c.onchange = updCount);
+  }).catch(e => { $("#seedList").innerHTML = `<div class="hint" style="padding:12px">Couldn't load playlists.</div>`; toast(e.message); });
   $("#start").onclick = startSession;
 }
 
@@ -419,19 +439,38 @@ async function startSession(){
   const desc = $("#desc").value.trim().replace(/\s+/g, " ");
   const guide = $("#guide").value.trim();
   const mode = $('input[name="mode"]:checked').value;
-  const seedSel = $("#seed");
-  const seedId = seedSel.value;
-  const seedName = seedId ? seedSel.options[seedSel.selectedIndex].text.replace(/\s\(\d+\)$/, "") : null;
+  const picked = [...document.querySelectorAll("#seedList input:checked")].map(x => ({ id: x.value, name: x.dataset.name }));
+  const round = $("#round").value;
   if (!name) { toast("Give the playlist a name."); return; }
-  if (!desc && !guide) { toast("Add a description so the picker knows what you want."); return; }
-  if (mode === "seed" && !seedId) { toast("Choose a playlist to start from, or pick Batches only."); return; }
+  if (!desc && !guide) { toast("Add a description so Claude knows what you want."); return; }
+  if (mode === "seed" && !picked.length) { toast("Pick at least one playlist, or choose Batches only."); return; }
   const btn = $("#start"); btn.disabled = true;
   try {
-    let queue = [];
+    let queue = [], pool = [], names = [];
     if (mode === "seed") {
-      btn.textContent = "Loading songs…";
-      queue = await loadPlaylistTracks(seedId);
-      if (!queue.length) toast("That playlist had no playable songs, so we'll go straight to batches.");
+      const lists = [];
+      for (const p of picked) {
+        btn.textContent = `Loading “${p.name}”…`;
+        try {
+          const l = await loadPlaylistTracks(p.id);
+          if (l.length) { lists.push(l); names.push(p.name); }
+        } catch (e) {
+          toast(`Couldn't read “${p.name}” (${e.status === 403 || e.status === 404 ? "not yours" : e.message}). Skipping it.`, 5000);
+        }
+      }
+      // alternate between playlists: A1, B1, A2, B2 ... skipping duplicates
+      const combined = [], u = new Set(), k = new Set();
+      const max = Math.max(0, ...lists.map(l => l.length));
+      for (let i = 0; i < max; i++) for (const l of lists) {
+        const t = l[i]; if (!t) continue;
+        const key = keyOf(t);
+        if (u.has(t.uri) || k.has(key)) continue;
+        u.add(t.uri); k.add(key); combined.push(t);
+      }
+      if (!combined.length) toast("Those playlists had no playable songs, so we'll go straight to batches.");
+      const n = round === "all" ? combined.length : parseInt(round, 10);
+      queue = combined.slice(0, n);
+      pool = combined.slice(n).map((t, i) => Object.assign(t, { code: "P" + (i + 1) }));
     }
     btn.textContent = "Creating playlist…";
     const pl = await sp("POST", "/me/playlists", { name, description: desc.slice(0, 300), public: $("#pub").checked });
@@ -439,7 +478,7 @@ async function startSession(){
     S = {
       id: randomString(10), created: Date.now(), name, desc, guide,
       playlistId: pl.id, playlistUrl: pl.external_urls?.spotify || ("https://open.spotify.com/playlist/" + pl.id),
-      seedName: queue.length ? seedName : null, seedTotal: queue.length, seedDone: 0,
+      seedNames: names, seedTotal: queue.length, seedDone: 0, pool,
       queue, yes: [], no: [], hist: [], seenU: [], seenK: [], batch: 0, read: ""
     };
     seenU = new Set(); seenK = new Set(); playing = { uri: null, on: false };
@@ -448,9 +487,7 @@ async function startSession(){
     show("swipe");
     if (cfg.autoplay && S.queue[0]) playCurrent(true);
   } catch (e) {
-    toast(e.status === 403 || e.status === 404
-      ? "Spotify wouldn't share that playlist's songs. Make sure it's one you own."
-      : e.message);
+    toast(e.message);
     btn.disabled = false; btn.textContent = "Start swiping";
   }
 }
@@ -491,7 +528,7 @@ function updateSwipe(){
   $("#count").textContent = `♥ ${S.yes.length} added`;
   const t = S.queue[0];
   let status = "";
-  if (t?.src === "seed") status = `From “${esc(S.seedName)}” · ${S.seedDone + 1} of ${S.seedTotal}`;
+  if (t?.src === "seed") status = `Starting round · ${S.seedDone + 1} of ${S.seedTotal}`;
   else if (t?.src === "batch") status = `Batch ${t.batch} · song ${t.pos} of ${t.of}`;
   if (t && S.queue.length <= 5) status += ` · ${S.queue.length} left · <a href="#" id="getmore">get next batch</a>`;
   $("#status").innerHTML = status;
@@ -501,7 +538,7 @@ function updateSwipe(){
   const stage = $("#stage");
   if (!t) { batchPanel(stage, null); updatePlayBtn(); return; }
   const meta = [t.album, t.year].filter(Boolean).map(esc).join(" · ");
-  const why = t.src === "seed" ? "" : (t.why ? esc(t.why) : "");
+  const why = t.src === "seed" ? "" : ((t.fromPool ? `<span class="tag">From your playlists</span>` : "") + (t.why ? esc(t.why) : ""));
   stage.innerHTML = `
     <div class="card" id="card">
       <div class="art">${t.img ? `<img src="${esc(t.img)}" alt="">` : `<span style="font-size:60px">♪</span>`}</div>
@@ -654,19 +691,30 @@ function buildRequest(){
   const n = cfg.batchSize || 10;
   const L = a => a.map(label).join("\n");
   const yes = S.yes.slice(-200), no = S.no.slice(-200);
+  const names = S.seedNames || (S.seedName ? [S.seedName] : []);
+  const pool = S.pool || [];
+  let shown = pool;
+  if (pool.length > 400) {
+    const idx = pool.map((_, i) => i);
+    for (let i = idx.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [idx[i], idx[j]] = [idx[j], idx[i]]; }
+    shown = idx.slice(0, 400).sort((x, y) => x - y).map(i => pool[i]);
+  }
   return [
     `SPLINDER REQUEST · batch ${S.batch + 1}`,
-    `Claude: pick the next ${n} songs for my Splinder playlist session. Use my Spotify connection to find real songs that fit and to explore artists similar to my yeses. Never repeat a song listed below.`,
+    `Claude: pick the next ${n} songs for my Splinder playlist session. Use my Spotify connection to find real songs that fit and to explore artists similar to my yeses. Never repeat a song from my YES, NO or queue lists.`,
     `Rules: the playlist name and description define the vibe; use my yes/no history to learn my taste inside it (artists, era, energy, tempo, mood, vocals, production). If I keep rejecting something, stop suggesting it. About 70% confident picks close to my yeses, about 30% exploration that still fits. With little feedback yet, give a varied spread. Max 2 songs per artist. Original studio versions only (no live, remix, cover or sped-up versions unless asked). Best picks first.`,
-    `Reply with ONE code block in exactly this format, one song per line:\nSPLINDER BATCH\nread: <one sentence on what you've learned about my taste>\n<Song title> | <Artist> | <why it fits, under 12 words>`,
+    pool.length ? `Pool: MY POOL below is the unseen rest of my starting playlists. Mix pool songs with brand-new songs and decide the ratio yourself: lean on the pool when its songs match my yeses well, add more new songs when they don't. Skip pool songs that look like my nos. A batch can be all pool, all new, or anything between.` : null,
+    `Reply with ONE code block in exactly this format, one song per line:\nSPLINDER BATCH\nread: <one sentence on what you've learned about my taste>\n<Song title> | <Artist> | <why it fits, under 12 words>` +
+      (pool.length ? `\nFor a song from MY POOL, use its code instead: P<number> | <why it fits>` : ""),
     ``,
     `PLAYLIST: ${S.name}`,
     `DESCRIPTION: ${S.desc || "(none)"}`,
     S.guide ? `GUIDANCE: ${S.guide}` : null,
-    S.seedName ? `STARTED FROM MY PLAYLIST: "${S.seedName}"` : null,
+    names.length ? `STARTED FROM MY PLAYLISTS: ${names.map(x => `"${x}"`).join(", ")}` : null,
     `\nYES (${S.yes.length}${S.yes.length > 200 ? ", latest 200 shown" : ""}):\n${L(yes) || "(none yet)"}`,
     `\nNO (${S.no.length}${S.no.length > 200 ? ", latest 200 shown" : ""}):\n${L(no) || "(none yet)"}`,
-    S.queue.length ? `\nSTILL IN MY QUEUE (don't repeat):\n${L(S.queue.slice(0, 100))}` : null
+    S.queue.length ? `\nSTILL IN MY QUEUE (don't repeat):\n${L(S.queue.slice(0, 100))}` : null,
+    pool.length ? `\nMY POOL (${pool.length} unseen songs${pool.length > 400 ? ", random 400 shown" : ""}):\n${shown.map(t => `${t.code} ${label(t)}`).join("\n")}` : null
   ].filter(x => x !== null).join("\n");
 }
 
@@ -678,6 +726,8 @@ function parseBatch(text){
     const r = l.match(/^read\s*:\s*(.+)$/i); if (r) { read = r[1]; continue; }
     l = l.replace(/^(\d+[.)]|[-*•])\s+/, "");
     const parts = l.split("|").map(s => s.trim());
+    const pc = l.match(/^(P\d+)\b/i);
+    if (pc) { songs.push({ code: pc[1].toUpperCase(), why: parts.length > 1 ? parts[parts.length - 1] : "" }); continue; }
     const id = (l.match(/(?:spotify:track:|open\.spotify\.com\/(?:intl-[a-z-]+\/)?track\/)([A-Za-z0-9]{22})/) || [])[1];
     if (id) { songs.push({ id, why: parts.length >= 3 && !/spotify/.test(parts[2]) ? parts[2] : "" }); continue; }
     if (parts.length >= 2 && parts[0] && parts[1]) {
@@ -702,6 +752,10 @@ function scoreMatch(t, c){
   return s;
 }
 async function resolveOne(c){
+  if (c.code) {
+    const t = (S.pool || []).find(x => x.code === c.code);
+    return t ? Object.assign({}, t, { why: String(c.why || "") }) : null;
+  }
   if (c.id) {
     try { const t = await sp("GET", `/tracks/${c.id}`, null, { query: { market: "from_token" } }); return Object.assign(compact(t), { why: String(c.why || "") }); }
     catch { return null; }
@@ -732,7 +786,11 @@ async function addBatchFromText(text){
   for (const t of resolved) {
     if (!t) missing++;
     else if (isSeen(t)) dup++;
-    else { markSeen(t); found.push(t); }
+    else {
+      markSeen(t); found.push(t);
+      const pi = (S.pool || []).findIndex(p => p.uri === t.uri || keyOf(p) === keyOf(t));
+      if (pi >= 0) { S.pool.splice(pi, 1); t.fromPool = true; }
+    }
   }
   if (!found.length) throw new Error(`None of those could be added (${missing} not found on Spotify, ${dup} already seen).`);
   S.batch++;
@@ -823,7 +881,7 @@ function renderDone(){
   $("#app").innerHTML = `
     <div class="bar"><button class="icon" id="back">‹</button><h1 style="margin:6px 0">${esc(S.name)}</h1></div>
     <div class="big-num">${S.yes.length}</div>
-    <p style="text-align:center;color:var(--muted);margin-top:0">songs added to your playlist</p>
+    <p style="text-align:center;color:var(--muted);margin-top:0">songs added to your playlist${S.pool?.length ? `<br>${S.pool.length} songs from your starting playlists not shown yet` : ""}</p>
     <a class="primary btnlink" href="${esc(S.playlistUrl)}" target="_blank" rel="noopener">Open in Spotify</a>
     <button class="ghost" id="pause">Pause playback</button>
     <button class="ghost" id="more">Keep swiping</button>
