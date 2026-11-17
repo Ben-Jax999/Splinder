@@ -504,6 +504,7 @@ function renderSwipe(){
     <div class="status" id="status"></div>
     <div class="read" id="read"></div>
     <div class="stage" id="stage"></div>
+    <div class="status" id="pnote" style="text-align:center;margin:10px 0 0"></div>
     <div class="controls">
       <button class="ctl" id="undo" title="Undo (Z)">↶</button>
       <button class="ctl big no" id="no" title="No (←)">✕</button>
@@ -645,22 +646,53 @@ async function pickDevice(){
   const mobile = /iPhone|iPad|Android/i.test(navigator.userAgent);
   return list.find(x => x.is_active) || list.find(x => x.type === (mobile ? "Smartphone" : "Computer")) || list[0];
 }
-async function playUri(uri, deviceId){
+const NO_DEVICE = "No Spotify app found. Open Spotify (desktop or phone), play any song for a second, then tap ▶ here.";
+let playToken = 0;
+function setPlayNote(msg, isErr){
+  const el = $("#pnote"); if (!el) return;
+  el.textContent = msg || ""; el.style.color = isErr ? "var(--no)" : "";
+}
+async function playUri(uri){
+  // Always aim the command at a specific device so Spotify can't ignore it.
+  let d = await pickDevice();
+  if (!d) throw new Error(NO_DEVICE);
   try {
-    await sp("PUT", "/me/player/play", { uris: [uri] }, deviceId ? { query: { device_id: deviceId } } : {});
+    await sp("PUT", "/me/player/play", { uris: [uri] }, { query: { device_id: d.id } });
   } catch (e) {
-    if (!deviceId && (e.status === 404 || /device/i.test(e.message))) {
-      const d = await pickDevice();
-      if (!d) throw new Error("No Spotify app found. Open Spotify, play any song for a second, then come back and tap ▶.");
-      return playUri(uri, d.id);
-    }
-    throw e;
+    if (e.status === 404 || e.status === 502 || /device/i.test(e.message)) {
+      await sleep(600);
+      d = await pickDevice(); if (!d) throw new Error(NO_DEVICE);
+      await sp("PUT", "/me/player/play", { uris: [uri] }, { query: { device_id: d.id } });
+    } else throw e;
   }
+  return d;
+}
+function sameTrack(item, t){
+  if (!item) return false;
+  if (item.uri === t.uri || item.linked_from?.uri === t.uri) return true;
+  return norm(item.name) === norm(t.name);
+}
+async function verifyPlaying(t, token, dev, tries = 0){
+  await sleep(1200);
+  if (token !== playToken || S?.queue[0]?.uri !== t.uri) return;
+  const p = await sp("GET", "/me/player/currently-playing").catch(() => null);
+  if (token !== playToken) return;
+  if (sameTrack(p?.item, t)) { playing = { uri: t.uri, on: !!p.is_playing }; updatePlayBtn(); setPlayNote(`Playing on ${dev?.name || "Spotify"}`); return; }
+  if (tries < 2) {
+    try { dev = await playUri(t.uri); } catch (e) { setPlayNote(e.message, true); return; }
+    return verifyPlaying(t, token, dev, tries + 1);
+  }
+  setPlayNote(`Spotify didn't switch songs${p?.item?.name ? ` (still playing “${p.item.name}”)` : ""}. Tap ▶ to try again.`, true);
 }
 async function playCurrent(auto = false){
   const t = S?.queue[0]; if (!t) return;
-  try { await playUri(t.uri); playing = { uri: t.uri, on: true }; }
-  catch (e) { toast(e.message, auto ? 5000 : 4200); }
+  const token = ++playToken;
+  setPlayNote("Starting song…");
+  try {
+    const dev = await playUri(t.uri);
+    playing = { uri: t.uri, on: true }; updatePlayBtn();
+    verifyPlaying(t, token, dev);
+  } catch (e) { if (token === playToken) setPlayNote(e.message, true); }
   updatePlayBtn();
 }
 async function togglePlay(){
@@ -668,8 +700,8 @@ async function togglePlay(){
   try {
     if (playing.uri === t.uri && playing.on) { await sp("PUT", "/me/player/pause"); playing.on = false; }
     else if (playing.uri === t.uri) { await sp("PUT", "/me/player/play"); playing.on = true; }
-    else { await playUri(t.uri); playing = { uri: t.uri, on: true }; }
-  } catch (e) { toast(e.message); }
+    else { await playCurrent(); return; }
+  } catch (e) { setPlayNote(e.message, true); }
   updatePlayBtn();
 }
 async function jump(){
